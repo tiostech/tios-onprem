@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+tiosvm-metadata - EC2-style instance metadata service for tiosvm VMs.
+
+VMs call http://169.254.169.254/... exactly like on EC2. The host redirects that
+address (nftables DNAT in tios-vpc-nat) to this service on port 8775, and the
+service answers for the VM that made the request, found by its source IP in
+/var/lib/tiosvm/instances/*.json.
+
+Supported (what Salt, telegraf, ftrpowerflow and the AWS CLI use):
+  PUT  /latest/api/token                          IMDSv2 token
+  GET  /latest/meta-data/...                      instance-id, instance-type, local-ipv4,
+                                                  hostname, placement/region, mac, tags, ...
+  GET  /latest/dynamic/instance-identity/document
+  GET  /latest/user-data
+  GET  /latest/meta-data/iam/info, iam/security-credentials/<role>
+IMDSv1 (no token) and IMDSv2 both work, like an EC2 instance with HttpTokens=optional.
+
+IAM credentials: a VM launched with `tiosvm launch --iam-role ROLE` gets temporary
+credentials for that role, like an EC2 instance profile. The host gets them with
+sts:AssumeRole (session name = instance ID) using its own AWS identity, profile
+"host" in /etc/tiosvm/aws/config (IAM Roles Anywhere credential_process, or an
+access key in /etc/tiosvm/aws/credentials). Without that, iam/... returns 404.
+"""
+
+import glob
+import json
+import os
+import secrets
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LISTEN = ("0.0.0.0", int(os.environ.get("TIOSVM_METADATA_PORT", "8775")))
+STATE_DIR = "/var/lib/tiosvm/instances"
+IMAGES_DIR = "/var/lib/libvirt/images"
+REGION = os.environ.get("TIOSVM_REGION", "us-east-1")
+AZ = os.environ.get("TIOSVM_AZ", "us-east-1-onprem")
+ACCOUNT_ID = os.environ.get("TIOSVM_ACCOUNT_ID", "345847152578")
+VPC_CIDR = os.environ.get("TIOSVM_VPC_CIDR", "10.50.0.0/24")
+
+AWS_PROFILE = os.environ.get("TIOSVM_AWS_PROFILE", "host")
+os.environ.setdefault("AWS_CONFIG_FILE", "/etc/tiosvm/aws/config")
+os.environ.setdefault("AWS_SHARED_CREDENTIALS_FILE", "/etc/tiosvm/aws/credentials")
+REFRESH_BEFORE = 15 * 60  # renew role credentials when less than 15 min are left
+
+_tokens = {}  # token -> (source ip, expiry)
+_tokens_lock = threading.Lock()
+_creds = {}  # (instance id, role) -> credentials dict
+_creds_lock = threading.Lock()
+_sts = None
+
+
+def _iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def role_credentials(inst):
+    """Temporary credentials for the VM's role, cached until close to expiry. None on failure."""
+    global _sts
+    role, iid = inst.get("iam_role"), inst["id"]
+    key = (iid, role)
+    with _creds_lock:
+        cached = _creds.get(key)
+        if cached and cached["_expires"] - time.time() > REFRESH_BEFORE:
+            return cached
+        try:
+            if _sts is None:
+                import boto3  # only needed when a VM has a role
+                _sts = boto3.Session(profile_name=AWS_PROFILE).client("sts", region_name=REGION)
+            resp = _sts.assume_role(
+                RoleArn=f"arn:aws:iam::{ACCOUNT_ID}:role/{role}",
+                RoleSessionName=iid,
+                DurationSeconds=3600,
+            )
+        except Exception as e:  # noqa: BLE001 - any failure means "no credentials"
+            print(f"assume_role {role} for {iid} failed: {e}", flush=True)
+            _sts = None
+            return cached if cached and cached["_expires"] > time.time() else None
+        c = resp["Credentials"]
+        expires = c["Expiration"].timestamp()
+        creds = {
+            "Code": "Success",
+            "LastUpdated": _iso(time.time()),
+            "Type": "AWS-HMAC",
+            "AccessKeyId": c["AccessKeyId"],
+            "SecretAccessKey": c["SecretAccessKey"],
+            "Token": c["SessionToken"],
+            "Expiration": _iso(expires),
+            "_expires": expires,
+        }
+        _creds[key] = creds
+        return creds
+
+
+def forget_credentials(live_ids):
+    with _creds_lock:
+        for key in [k for k in _creds if k[0] not in live_ids]:
+            del _creds[key]
+
+
+def find_instance(ip):
+    found, live_ids = None, set()
+    for path in glob.glob(os.path.join(STATE_DIR, "i-*.json")):
+        try:
+            with open(path) as f:
+                inst = json.load(f)
+        except (OSError, ValueError):
+            continue
+        live_ids.add(inst.get("id"))
+        if inst.get("ip") == ip:
+            found = inst
+    forget_credentials(live_ids)  # drop cached credentials of terminated VMs
+    return found
+
+
+def identity_document(inst):
+    return {
+        "accountId": ACCOUNT_ID,
+        "architecture": "x86_64",
+        "availabilityZone": AZ,
+        "imageId": inst.get("image", "ami-onprem"),
+        "instanceId": inst["id"],
+        "instanceType": inst["type"],
+        "pendingTime": inst["launched_at"],
+        "privateIp": inst["ip"],
+        "region": REGION,
+        "version": "2017-09-30",
+    }
+
+
+def meta_data_tree(inst):
+    """Flat path -> value map for /latest/meta-data/. Directories are derived from it."""
+    mac = inst["mac"]
+    hostname = inst["hostname"]
+    tree = {
+        "ami-id": inst.get("image", "ami-onprem"),
+        "ami-launch-index": "0",
+        "hostname": hostname,
+        "instance-id": inst["id"],
+        "instance-life-cycle": "on-demand",
+        "instance-type": inst["type"],
+        "local-hostname": hostname,
+        "local-ipv4": inst["ip"],
+        "mac": mac,
+        "placement/availability-zone": AZ,
+        "placement/region": REGION,
+        "services/domain": "amazonaws.com",
+        "services/partition": "aws",
+        f"network/interfaces/macs/{mac}/local-ipv4s": inst["ip"],
+        f"network/interfaces/macs/{mac}/mac": mac,
+        f"network/interfaces/macs/{mac}/subnet-ipv4-cidr-block": VPC_CIDR,
+        f"network/interfaces/macs/{mac}/vpc-ipv4-cidr-block": VPC_CIDR,
+        f"network/interfaces/macs/{mac}/vpc-id": "vpc-onprem",
+        f"network/interfaces/macs/{mac}/subnet-id": "subnet-onprem",
+    }
+    for key, value in (inst.get("tags") or {}).items():
+        tree[f"tags/instance/{key}"] = str(value)
+    if inst.get("iam_role"):
+        # Placeholders so directory listings show iam/; the values are served by iam_response()
+        tree["iam/info"] = ""
+        tree[f"iam/security-credentials/{inst['iam_role']}"] = ""
+    return tree
+
+
+def iam_response(inst, sub):
+    """(code, body) for meta-data/iam/<sub>, or None if sub is not an iam leaf."""
+    role = inst.get("iam_role")
+    if not role:
+        return 404, "Not Found"
+    sub = sub.strip("/")
+    if sub == "info":
+        return 200, json.dumps({
+            "Code": "Success",
+            "LastUpdated": _iso(time.time()),
+            "InstanceProfileArn": f"arn:aws:iam::{ACCOUNT_ID}:instance-profile/{role}",
+            "InstanceProfileId": "AIPAONPREM" + inst["id"][2:12].upper(),
+        }, indent=2)
+    if sub == f"security-credentials/{role}":
+        creds = role_credentials(inst)
+        if creds is None:
+            return 404, "Not Found"
+        return 200, json.dumps({k: v for k, v in creds.items() if not k.startswith("_")}, indent=2)
+    return None
+
+
+def lookup(tree, path):
+    """Return (body, found). A directory lists its children, like EC2."""
+    path = path.strip("/")
+    if path in tree:
+        return tree[path], True
+    prefix = path + "/" if path else ""
+    children = []
+    for key in tree:
+        if key.startswith(prefix):
+            rest = key[len(prefix):]
+            child = rest.split("/", 1)[0] + ("/" if "/" in rest else "")
+            if child not in children:
+                children.append(child)
+    if children:
+        return "\n".join(sorted(children)), True
+    return "", False
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "EC2ws"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):  # journald gets the access log
+        print(f"{self.client_address[0]} {fmt % args}", flush=True)
+
+    def send(self, code, body="", content_type="text/plain"):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def token_ok(self, ip):
+        token = self.headers.get("X-aws-ec2-metadata-token")
+        if token is None:
+            return True  # IMDSv1
+        with _tokens_lock:
+            owner = _tokens.get(token)
+        return owner is not None and owner[0] == ip and owner[1] > time.time()
+
+    def do_PUT(self):
+        ip = self.client_address[0]
+        if self.path.rstrip("/") != "/latest/api/token":
+            return self.send(404, "Not Found")
+        if self.headers.get("X-Forwarded-For"):
+            return self.send(403, "Forbidden")
+        try:
+            ttl = int(self.headers.get("X-aws-ec2-metadata-token-ttl-seconds", ""))
+        except ValueError:
+            return self.send(400, "Bad Request")
+        if not 1 <= ttl <= 21600:
+            return self.send(400, "Bad Request")
+        token = secrets.token_urlsafe(40)
+        now = time.time()
+        with _tokens_lock:
+            for t in [t for t, (_, exp) in _tokens.items() if exp < now]:
+                del _tokens[t]
+            _tokens[token] = (ip, now + ttl)
+        self.send(200, token)
+
+    def do_GET(self):
+        ip = self.client_address[0]
+        inst = find_instance(ip)
+        if inst is None:
+            return self.send(404, "Not Found")
+        if not self.token_ok(ip):
+            return self.send(401, "Unauthorized")
+
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/latest", "/latest/"):
+            return self.send(200, "dynamic\nmeta-data\nuser-data")
+
+        if path.startswith("/latest/meta-data/iam/"):
+            result = iam_response(inst, path[len("/latest/meta-data/iam/"):])
+            if result is not None:
+                return self.send(*result)
+
+        if path.startswith("/latest/meta-data"):
+            body, found = lookup(meta_data_tree(inst), path[len("/latest/meta-data"):])
+            return self.send(200 if found else 404, body if found else "Not Found")
+
+        if path.rstrip("/") == "/latest/dynamic/instance-identity/document":
+            return self.send(200, json.dumps(identity_document(inst), indent=2), "application/json")
+        if path.rstrip("/") in ("/latest/dynamic", "/latest/dynamic/instance-identity"):
+            return self.send(200, "instance-identity/" if path.rstrip("/").endswith("dynamic") else "document")
+
+        if path.rstrip("/") == "/latest/user-data":
+            try:
+                with open(os.path.join(IMAGES_DIR, inst["id"], "user-data"), "rb") as f:
+                    return self.send(200, f.read(), "application/octet-stream")
+            except OSError:
+                return self.send(404, "Not Found")
+
+        self.send(404, "Not Found")
+
+    do_HEAD = do_GET
+
+
+if __name__ == "__main__":
+    ThreadingHTTPServer.daemon_threads = True
+    print(f"tiosvm-metadata listening on {LISTEN[0]}:{LISTEN[1]}", flush=True)
+    ThreadingHTTPServer(LISTEN, Handler).serve_forever()

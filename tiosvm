@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+#
+# tiosvm - launch and manage EC2-like VMs on a Tios on-prem KVM host.
+#
+#   tiosvm launch --name NAME [--type TYPE | --cpus N --memory GB] [--disk 50G]
+#                 [--user-data FILE] [--tag KEY=VALUE]... [--ssh-key FILE]
+#                 [--terminate-on-shutdown] [--iam-role ROLE] [--instance-id i-...]
+#   tiosvm list
+#   tiosvm describe        ID|NAME
+#   tiosvm start|stop|reboot|terminate ID|NAME...
+#   tiosvm console         ID|NAME     (serial console, Ctrl+] to leave)
+#   tiosvm console-output  ID|NAME     (boot + cloud-init log, like EC2 "get console output")
+#   tiosvm types                       (instance types and their CPU/RAM)
+#   tiosvm capacity                    (free CPU/RAM on this host)
+#   tiosvm image-update                (download the latest Ubuntu 24.04 cloud image)
+#   tiosvm reap                        (delete VMs launched with --terminate-on-shutdown that shut down)
+#
+# Exit code 3 = not enough free CPU/RAM (like EC2 InsufficientInstanceCapacity).
+# Run with sudo. Installed by setup_kvm_host.sh. See README.md.
+
+set -Eeuo pipefail
+# Note: no "cmd | grep -q" below. grep -q exits early, cmd gets SIGPIPE and
+# pipefail turns a match into a failure. Use "grep ... >/dev/null" instead.
+
+export LIBVIRT_DEFAULT_URI="qemu:///system"   # also lets libvirt-group users run list/describe without sudo
+NET_NAME="${TIOSVM_NET:-tiosvpc}"
+STATE_DIR="/var/lib/tiosvm/instances"
+IMAGES_DIR="/var/lib/libvirt/images"
+BASE_DIR="/var/lib/libvirt/base"
+BASE_IMAGE="$BASE_DIR/ubuntu-24.04.img"          # symlink to the current image
+IMAGE_URL="https://cloud-images.ubuntu.com/noble/current"
+IMAGE_FILE="noble-server-cloudimg-amd64.img"
+KEYS_FILE="/etc/tiosvm/authorized_keys"
+CONSOLE_LOG_DIR="/var/log/libvirt/qemu"
+LOCK_FILE="/run/tiosvm.lock"
+IP_FIRST=10                                       # tiosvm uses .10-.99 as fixed IPs;
+IP_LAST=99                                        # the DHCP pool .100-.254 is left for anything else
+DEFAULT_DISK="50G"
+HOST_RESERVED_GB="${TIOSVM_HOST_RESERVED_GB:-8}"  # RAM kept for the host itself
+CPU_OVERCOMMIT="${TIOSVM_CPU_OVERCOMMIT:-1}"      # 1 = never hand out more vCPUs than host threads
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARNING: $*" >&2; }
+
+# ---- Instance types ----------------------------------------------------------
+# type -> "vCPUs memoryGB". EC2 sizes, plus tiosaws group names
+# (app/modules/ec2_helpers/instance_groups.rb, first choice of each group).
+TYPES="t3.micro t3.small t3.medium t3.large t3.xlarge
+c5.large c5.xlarge c4.xlarge c5.2xlarge c5.4xlarge
+m5.large m5.xlarge m5.2xlarge m5.4xlarge m6i.large m6i.xlarge m6i.2xlarge m6i.4xlarge
+r5.large r5.xlarge r5.2xlarge r5.4xlarge r8i.large r8i.xlarge r8i.2xlarge r8i.4xlarge
+cpu2 cpu4 cpu8 cpu16 mem16 mem30 mem60 mem120"
+
+type_spec() {
+  case "$1" in
+    t3.micro)                     echo "2 1" ;;
+    t3.small)                     echo "2 2" ;;
+    t3.medium)                    echo "2 4" ;;
+    t3.large)                     echo "2 8" ;;
+    t3.xlarge)                    echo "4 16" ;;
+    c5.large|cpu2)                echo "2 4" ;;
+    c5.xlarge|c4.xlarge|cpu4)     echo "4 8" ;;
+    c5.2xlarge|cpu8)              echo "8 16" ;;
+    c5.4xlarge|cpu16)             echo "16 32" ;;
+    m5.large|m6i.large)           echo "2 8" ;;
+    m5.xlarge|m6i.xlarge)         echo "4 16" ;;
+    m5.2xlarge|m6i.2xlarge)       echo "8 32" ;;
+    m5.4xlarge|m6i.4xlarge)       echo "16 64" ;;
+    r5.large|r8i.large|mem16)     echo "2 16" ;;
+    r5.xlarge|r8i.xlarge|mem30)   echo "4 32" ;;
+    r5.2xlarge|r8i.2xlarge|mem60) echo "8 64" ;;
+    r5.4xlarge|r8i.4xlarge|mem120) echo "16 128" ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---- Helpers -----------------------------------------------------------------
+need_root() { [ "$(id -u)" -eq 0 ] || die "Run with sudo."; }
+
+take_lock() { exec 9>"$LOCK_FILE"; flock 9; }
+
+state_file() { echo "$STATE_DIR/$1.json"; }
+
+all_state_files() {
+  local f
+  for f in "$STATE_DIR"/i-*.json; do [ -e "$f" ] && echo "$f"; done
+  return 0
+}
+
+dom_state() { virsh domstate "$1" 2>/dev/null || echo "missing"; }
+
+# Accept an instance ID or a Name (if only one VM has that name)
+resolve_id() {
+  local arg="$1" ids n
+  if [ -f "$(state_file "$arg")" ]; then echo "$arg"; return; fi
+  ids=$(all_state_files | while read -r f; do jq -r --arg n "$arg" 'select(.name==$n) | .id' "$f"; done)
+  n=$(printf '%s' "$ids" | grep -c . || true)
+  [ "$n" -gt 0 ] || die "No VM with ID or name '$arg'. See: tiosvm list"
+  [ "$n" -eq 1 ] || die "Several VMs are named '$arg': $(echo $ids). Use the instance ID."
+  echo "$ids"
+}
+
+set_state() { # set_state ID 'jq expression'
+  local f tmp
+  f=$(state_file "$1"); tmp="$f.tmp"
+  jq "$2" "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+net_prefix() { # "10.50.0" from the network's gateway address
+  virsh net-dumpxml "$NET_NAME" | sed -n "/<ip address=/{s/.*<ip address='\([0-9]*\.[0-9]*\.[0-9]*\)\.[0-9]*'.*/\1/p;q}"
+}
+
+new_id() { echo "i-$(openssl rand -hex 9 | cut -c1-17)"; }
+
+new_mac() { echo "52:54:00:$(openssl rand -hex 3 | sed 's/\(..\)\(..\)\(..\)/\1:\2:\3/')"; }
+
+alloc_ip() {
+  local prefix used i ip
+  prefix=$(net_prefix)
+  [ -n "$prefix" ] || die "Cannot read the $NET_NAME network address. Is setup_kvm_host.sh done?"
+  used=" $(all_state_files | while read -r f; do jq -r .ip "$f"; done | tr '\n' ' ') "
+  used+="$(virsh net-dumpxml "$NET_NAME" | sed -n "s/.*<host .*ip='\([0-9.]*\)'.*/\1/p" | tr '\n' ' ') "
+  # Also skip IPs that still have a DHCP lease (e.g. from a VM terminated less than an hour ago)
+  used+="$(virsh net-dhcp-leases "$NET_NAME" | awk '$4=="ipv4" {sub(/\/.*/, "", $5); print $5}' | tr '\n' ' ') "
+  for i in $(seq "$IP_FIRST" "$IP_LAST"); do
+    ip="$prefix.$i"
+    case "$used" in *" $ip "*) continue ;; esac
+    echo "$ip"; return
+  done
+  die "No free IPs left in $prefix.$IP_FIRST-$IP_LAST."
+}
+
+# Sum of CPU/RAM given to running VMs. Stopped VMs don't count (same as EC2).
+used_resources() {
+  local cpu=0 mem=0 f id
+  while read -r f; do
+    id=$(jq -r .id "$f")
+    case "$(dom_state "$id")" in
+      running|paused|"in shutdown")
+        cpu=$(( cpu + $(jq -r .cpus "$f") ))
+        mem=$(( mem + $(jq -r .memory_gb "$f") )) ;;
+    esac
+  done < <(all_state_files)
+  echo "$cpu $mem"
+}
+
+host_totals() {
+  local threads mem_gb
+  threads=$(nproc)
+  mem_gb=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
+  echo "$(( threads * CPU_OVERCOMMIT )) $(( mem_gb - HOST_RESERVED_GB ))"
+}
+
+check_capacity() { # check_capacity CPUS MEM_GB
+  local cpus="$1" mem="$2" used_cpu used_mem max_cpu max_mem
+  read -r used_cpu used_mem < <(used_resources)
+  read -r max_cpu max_mem < <(host_totals)
+  if [ $(( used_cpu + cpus )) -gt "$max_cpu" ] || [ $(( used_mem + mem )) -gt "$max_mem" ]; then
+    echo "InsufficientInstanceCapacity: need $cpus vCPU / ${mem} GB, free $(( max_cpu - used_cpu )) vCPU / $(( max_mem - used_mem )) GB." >&2
+    exit 3
+  fi
+}
+
+os_variant() {
+  if virt-install --osinfo list 2>/dev/null | grep -E '(^|[ ,])ubuntu24\.04(,|$)' >/dev/null; then
+    echo "ubuntu24.04"
+  else
+    echo "linux2022"
+  fi
+}
+
+# ---- Commands ----------------------------------------------------------------
+cmd_image_update() {
+  need_root
+  mkdir -p "$BASE_DIR"
+  local tmp="$BASE_DIR/.download.img" sums expected actual final
+  echo "Downloading $IMAGE_URL/$IMAGE_FILE ..."
+  curl -fL --retry 3 -o "$tmp" "$IMAGE_URL/$IMAGE_FILE"
+  sums=$(curl -fsSL --retry 3 "$IMAGE_URL/SHA256SUMS")
+  expected=$(awk -v f="$IMAGE_FILE" '$2==f || $2=="*"f {print $1}' <<< "$sums")
+  actual=$(sha256sum "$tmp" | awk '{print $1}')
+  [ -n "$expected" ] && [ "$expected" = "$actual" ] || { rm -f "$tmp"; die "Checksum mismatch for $IMAGE_FILE."; }
+  # Each image keeps its own file, because running VMs use it as their backing disk
+  final="$BASE_DIR/noble-${actual:0:12}.img"
+  if [ -e "$final" ]; then rm -f "$tmp"; else mv "$tmp" "$final"; chmod 444 "$final"; fi
+  ln -sfn "$(basename "$final")" "$BASE_IMAGE"
+  echo "Current image: $BASE_IMAGE -> $(basename "$final")"
+}
+
+cmd_launch() {
+  need_root
+  local name="" type="" cpus="" mem="" disk="$DEFAULT_DISK" user_data="" key_file="" tos=false iam_role="" iid=""
+  local tags=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)                   name="$2"; shift 2 ;;
+      --type)                   type="$2"; shift 2 ;;
+      --cpus)                   cpus="$2"; shift 2 ;;
+      --memory)                 mem="${2%G}"; shift 2 ;;
+      --disk)                   disk="$2"; shift 2 ;;
+      --user-data)              user_data="$2"; shift 2 ;;
+      --tag)                    tags+=("$2"); shift 2 ;;
+      --ssh-key)                key_file="$2"; shift 2 ;;
+      --terminate-on-shutdown)  tos=true; shift ;;
+      --iam-role)               iam_role="$2"; shift 2 ;;
+      --instance-id)            iid="$2"; shift 2 ;;   # tiosaws creates the ID up front
+      *) die "Unknown launch option: $1" ;;
+    esac
+  done
+
+  [ -n "$name" ] || die "--name is required."
+  [[ "$name" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "--name may only use letters, digits, '.', '_' and '-'."
+  if [ -n "$type" ]; then
+    local spec
+    spec=$(type_spec "$type") || die "Unknown type '$type'. See: tiosvm types"
+    read -r tcpus tmem <<< "$spec"
+    cpus="${cpus:-$tcpus}"; mem="${mem:-$tmem}"
+  fi
+  [ -n "$cpus" ] && [ -n "$mem" ] || die "Give --type, or both --cpus and --memory."
+  [[ "$cpus" =~ ^[0-9]+$ ]] && [ "$cpus" -ge 1 ] || die "--cpus must be a whole number."
+  [[ "$mem" =~ ^[0-9]+$ ]] && [ "$mem" -ge 1 ] || die "--memory must be whole GB, for example 8 or 8G."
+  [[ "$disk" =~ ^[0-9]+G$ ]] || die "--disk must look like 50G."
+  [ "${disk%G}" -ge 10 ] || die "--disk must be at least 10G."
+  [ -z "$user_data" ] || [ -r "$user_data" ] || die "Cannot read --user-data $user_data"
+  [ -z "$iam_role" ] || [[ "$iam_role" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]] || die "--iam-role must be an IAM role name."
+  [ -z "$iid" ] || [[ "$iid" =~ ^i-[0-9a-f]{17}$ ]] || die "--instance-id must look like i- plus 17 hex characters."
+  [ -z "$iid" ] || [ ! -e "$(state_file "$iid")" ] || die "Instance $iid already exists."
+  local t
+  for t in ${tags[@]+"${tags[@]}"}; do
+    [[ "$t" == *=* ]] || die "--tag must be KEY=VALUE (got '$t')."
+  done
+  [ -n "$key_file" ] || key_file="$KEYS_FILE"
+  if [ ! -r "$key_file" ]; then
+    warn "No SSH key file ($key_file). You can only log in if the user data adds a key."
+    key_file=/dev/null
+  fi
+  command -v cloud-localds >/dev/null || die "cloud-localds is missing. Re-run setup_kvm_host.sh."
+
+  [ -e "$BASE_IMAGE" ] || cmd_image_update
+
+  mkdir -p "$STATE_DIR"
+  take_lock
+  check_capacity "$cpus" "$mem"
+
+  local mac ip dir hostname
+  [ -n "$iid" ] || iid=$(new_id)
+  mac=$(new_mac)
+  ip=$(alloc_ip)
+  hostname="ip-${ip//./-}"
+  dir="$IMAGES_DIR/$iid"
+  mkdir -p "$dir"
+
+  # Tags -> JSON, with Name like on EC2
+  local tags_json
+  tags_json=$(jq -n --arg n "$name" '{Name: $n}')
+  for t in ${tags[@]+"${tags[@]}"}; do
+    tags_json=$(jq -c --arg k "${t%%=*}" --arg v "${t#*=}" '. + {($k): $v}' <<< "$tags_json")
+  done
+
+  jq -n --arg id "$iid" --arg name "$name" --arg type "${type:-custom}" \
+        --argjson cpus "$cpus" --argjson mem "$mem" --arg disk "$disk" \
+        --arg ip "$ip" --arg mac "$mac" --arg host "$hostname" \
+        --arg image "$(basename "$(readlink -f "$BASE_IMAGE")" .img)" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson epoch "$(date +%s)" \
+        --argjson tos "$tos" --argjson tags "$tags_json" --arg role "$iam_role" \
+    '{id: $id, name: $name, type: $type, cpus: $cpus, memory_gb: $mem, disk: $disk,
+      ip: $ip, mac: $mac, hostname: $host, image: $image, launched_at: $at, launched_epoch: $epoch,
+      terminate_on_shutdown: $tos, stopped_by_api: false, iam_role: $role, tags: $tags}' > "$(state_file "$iid")"
+
+  # From here on, clean up everything if a step fails
+  trap 'echo "Launch failed, cleaning up $iid" >&2; terminate_one "$iid" >/dev/null 2>&1 || true' ERR
+
+  # Root disk: thin copy of the base image, grown to --disk on first boot by cloud-init
+  qemu-img create -q -f qcow2 -F qcow2 -b "$(readlink -f "$BASE_IMAGE")" "$dir/disk.qcow2" "$disk"
+
+  # cloud-init NoCloud seed. User data is passed through unchanged, same as EC2.
+  local keys_json
+  keys_json=$({ grep -Ev '^[[:space:]]*(#|$)' "$key_file" || true; } | jq -R . | jq -s .)
+  jq -n --arg id "$iid" --arg host "$hostname" --argjson keys "$keys_json" \
+    '{"instance-id": $id, "local-hostname": $host, "public-keys": $keys}' > "$dir/meta-data"
+  if [ -n "$user_data" ]; then
+    cp "$user_data" "$dir/user-data"
+  else
+    printf '#cloud-config\n{}\n' > "$dir/user-data"
+  fi
+  # Fixed IP set inside the VM, so it never depends on getting the right DHCP lease
+  cat > "$dir/network-config" <<EOF
+version: 2
+ethernets:
+  primary:
+    match:
+      macaddress: "$mac"
+    addresses: [$ip/24]
+    routes:
+      - to: default
+        via: $(net_prefix).1
+    nameservers:
+      addresses: [$(net_prefix).1]
+EOF
+  cloud-localds --network-config="$dir/network-config" "$dir/seed.iso" "$dir/user-data" "$dir/meta-data"
+
+  # Fixed IP for this MAC
+  virsh net-update "$NET_NAME" add ip-dhcp-host \
+    "<host mac='$mac' name='$hostname' ip='$ip'/>" --live --config >/dev/null
+
+  # Build the VM definition, then add libvirt's clean-traffic filter so a VM can only
+  # use its own IP and MAC. The metadata service tells VMs apart by IP (and hands out
+  # IAM credentials), so a VM must not be able to pretend to be another one.
+  virt-install --print-xml \
+    --name "$iid" \
+    --metadata title="$name",description="tiosvm ${type:-custom}" \
+    --memory $(( mem * 1024 )) --vcpus "$cpus" --cpu host-passthrough \
+    --os-variant "$(os_variant)" --import \
+    --disk path="$dir/disk.qcow2",format=qcow2,bus=virtio,discard=unmap \
+    --disk path="$dir/seed.iso",device=cdrom,bus=sata \
+    --network network="$NET_NAME",mac="$mac",model=virtio \
+    --graphics none \
+    --serial pty,log.file="$CONSOLE_LOG_DIR/$iid-console.log" \
+    --rng /dev/urandom \
+    --events on_poweroff=destroy,on_reboot=restart,on_crash=restart > "$dir/domain.xml"
+  sed -i "s#</interface>#  <filterref filter=\"clean-traffic\"><parameter name=\"IP\" value=\"$ip\"/></filterref>\n    </interface>#" "$dir/domain.xml"
+  grep 'filter="clean-traffic"' "$dir/domain.xml" >/dev/null || { echo "ERROR: could not add the clean-traffic filter" >&2; false; }
+  virsh define "$dir/domain.xml" >/dev/null
+  virsh autostart "$iid" >/dev/null
+  virsh start "$iid" >/dev/null
+
+  trap - ERR
+  echo "$iid  $name  $ip  ${cpus} vCPU / ${mem} GB / $disk${iam_role:+  role $iam_role}"
+  echo "  ssh ubuntu@$ip            (once it has booted, about 30-60s)"
+  echo "  sudo tiosvm console-output $iid"
+}
+
+cmd_list() {
+  printf '%-20s %-28s %-12s %4s %5s %-13s %-10s %s\n' ID NAME TYPE CPU RAM IP STATE AGE
+  local f now
+  now=$(date +%s)
+  while read -r f; do
+    local id name type cpus mem ip epoch age
+    read -r id name type cpus mem ip epoch < <(jq -r '[.id,.name,.type,.cpus,.memory_gb,.ip,.launched_epoch] | @tsv' "$f")
+    age=$(( (now - epoch) / 60 ))
+    if [ "$age" -ge 1440 ]; then age="$(( age / 1440 ))d"; elif [ "$age" -ge 60 ]; then age="$(( age / 60 ))h"; else age="${age}m"; fi
+    printf '%-20s %-28s %-12s %4s %4sG %-13s %-10s %s\n' "$id" "${name:0:28}" "$type" "$cpus" "$mem" "$ip" "$(dom_state "$id" | tr ' ' '-')" "$age"
+  done < <(all_state_files)
+  echo
+  cmd_capacity
+}
+
+cmd_capacity() {
+  local used_cpu used_mem max_cpu max_mem
+  read -r used_cpu used_mem < <(used_resources)
+  read -r max_cpu max_mem < <(host_totals)
+  echo "Running VMs use $used_cpu/$max_cpu vCPU and $used_mem/$max_mem GB RAM (free: $(( max_cpu - used_cpu )) vCPU, $(( max_mem - used_mem )) GB)."
+}
+
+cmd_types() {
+  printf '%-12s %5s %6s\n' TYPE VCPU RAM
+  local t c m
+  for t in $TYPES; do
+    read -r c m < <(type_spec "$t")
+    printf '%-12s %5s %5sG\n' "$t" "$c" "$m"
+  done
+}
+
+cmd_describe() {
+  local id; id=$(resolve_id "$1")
+  jq --arg s "$(dom_state "$id")" '. + {state: $s}' "$(state_file "$id")"
+}
+
+cmd_start() {
+  need_root
+  local id; id=$(resolve_id "$1")
+  set_state "$id" '.stopped_by_api = false'
+  virsh autostart "$id" >/dev/null
+  [ "$(dom_state "$id")" = "running" ] || virsh start "$id" >/dev/null
+  echo "$id started"
+}
+
+cmd_stop() {
+  need_root
+  local id i; id=$(resolve_id "$1")
+  # Remember this was an API stop, so "reap" never deletes it (EC2 stop never terminates)
+  set_state "$id" '.stopped_by_api = true'
+  virsh autostart --disable "$id" >/dev/null
+  if [ "$(dom_state "$id")" = "running" ]; then
+    virsh shutdown "$id" >/dev/null
+    for i in $(seq 1 60); do
+      [ "$(dom_state "$id")" = "running" ] || break
+      sleep 2
+    done
+    [ "$(dom_state "$id")" = "running" ] && virsh destroy "$id" >/dev/null
+  fi
+  echo "$id stopped"
+}
+
+cmd_reboot() {
+  need_root
+  local id; id=$(resolve_id "$1")
+  virsh reboot "$id" >/dev/null
+  echo "$id rebooting"
+}
+
+terminate_one() {
+  local id="$1" f mac ip host
+  [[ "$id" =~ ^i-[0-9a-f]{17}$ ]] || die "Refusing to terminate '$id': not a tiosvm instance ID."
+  f=$(state_file "$id")
+  if [ -f "$f" ]; then
+    read -r mac ip host < <(jq -r '[.mac,.ip,.hostname] | @tsv' "$f")
+    virsh net-update "$NET_NAME" delete ip-dhcp-host \
+      "<host mac='$mac' name='$host' ip='$ip'/>" --live --config >/dev/null 2>&1 || true
+  fi
+  virsh destroy "$id" >/dev/null 2>&1 || true
+  virsh undefine "$id" >/dev/null 2>&1 || true
+  # virt-install registers the VM's folder as a libvirt storage pool; remove it too
+  virsh pool-destroy "$id" >/dev/null 2>&1 || true
+  virsh pool-undefine "$id" >/dev/null 2>&1 || true
+  rm -rf "${IMAGES_DIR:?}/$id"
+  rm -f "$CONSOLE_LOG_DIR/$id-console.log" "$f"
+}
+
+cmd_terminate() {
+  need_root
+  local id; id=$(resolve_id "$1")
+  take_lock
+  terminate_one "$id"
+  echo "$id terminated"
+}
+
+cmd_console() {
+  need_root
+  local id; id=$(resolve_id "$1")
+  exec virsh console "$id"
+}
+
+cmd_console_output() {
+  need_root
+  local id; id=$(resolve_id "$1")
+  cat "$CONSOLE_LOG_DIR/$id-console.log" 2>/dev/null || die "No console log yet for $id."
+}
+
+cmd_reap() {
+  need_root
+  take_lock
+  local f id tos api
+  while read -r f; do
+    read -r id tos api < <(jq -r '[.id,.terminate_on_shutdown,.stopped_by_api] | @tsv' "$f")
+    if [ "$tos" = "true" ] && [ "$api" = "false" ] && [ "$(dom_state "$id")" = "shut off" ]; then
+      terminate_one "$id"
+      echo "$id shut itself down, terminated"
+    fi
+  done < <(all_state_files)
+}
+
+# ---- Main --------------------------------------------------------------------
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  launch)          cmd_launch "$@" ;;
+  list|ls)         cmd_list ;;
+  describe)        [ $# -eq 1 ] || usage; cmd_describe "$1" ;;
+  start|stop|reboot|terminate)
+                   [ $# -ge 1 ] || usage
+                   for a in "$@"; do "cmd_$cmd" "$a"; done ;;
+  console)         [ $# -eq 1 ] || usage; cmd_console "$1" ;;
+  console-output)  [ $# -eq 1 ] || usage; cmd_console_output "$1" ;;
+  types)           cmd_types ;;
+  capacity)        cmd_capacity ;;
+  image-update)    cmd_image_update ;;
+  reap)            cmd_reap ;;
+  *)               usage ;;
+esac

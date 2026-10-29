@@ -102,14 +102,32 @@ done
 log "Builder $id started ($(jq -r .ip "$STATE_DIR/$id.json")). Waiting for user data and Salt (usually 20-30+ min) ..."
 
 # ---- 2b. Wait for user data + Salt to finish ------------------------------------------------------
-guest_has() { # guest_has DIR FILE  (read-only look into the running VM's disk)
-  virt-ls --ro -d "$id" "$1" 2>/dev/null | grep -x "$2" >/dev/null
+# guest_has DIR FILE: 0 = file is there, 1 = not (yet), 2 = could not look (virt-ls failed).
+# virt-ls only reads the VM's disk; it never writes.
+guest_has() {
+  local out
+  if ! out=$(virt-ls -d "$id" "$1" 2>&1); then
+    # A folder that doesn't exist yet is normal early on; anything else is a real error
+    case "$out" in *"No such file or directory"*) return 1 ;; esac
+    echo "$out" | tail -2 >&2
+    return 2
+  fi
+  grep -x "$2" >/dev/null <<< "$out"
 }
 done_ok=0
+errors=0
 for _ in $(seq 1 $(( SETUP_TIMEOUT_MIN * 60 / POLL_SECONDS ))); do
   [ -e "$STATE_DIR/$id.json" ] || die "Builder $id disappeared (terminated?)."
-  if guest_has /opt/tios SALT_COMPLETE.txt && guest_has /var/lib/cloud/instance boot-finished; then
-    done_ok=1; break
+  rc=0; guest_has /opt/tios SALT_COMPLETE.txt || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rc=0; guest_has /var/lib/cloud/instance boot-finished || rc=$?
+    [ "$rc" -eq 0 ] && { done_ok=1; break; }
+  fi
+  if [ "$rc" -eq 2 ]; then
+    errors=$(( errors + 1 ))
+    [ "$errors" -lt 3 ] || die "Cannot look inside builder $id (virt-ls failed 3 times in a row, see above)."
+  else
+    errors=0
   fi
   sleep "$POLL_SECONDS"
 done
@@ -117,7 +135,7 @@ done
 log "User data and Salt finished after $(elapsed)"
 
 # ---- 3. Check Salt's result, then bake ------------------------------------------------------------
-summary=$(virt-cat --ro -d "$id" /var/log/cloud-init-output.log 2>/dev/null | grep -a -A4 '^Summary for local' || true)
+summary=$(virt-cat -d "$id" /var/log/cloud-init-output.log 2>/dev/null | grep -a -A4 '^Summary for local' || true)
 echo "$summary" | grep -aE 'Succeeded|Failed' || true
 failed=$(echo "$summary" | awk '/^Failed:/ {n=$2} END {print n+0}')
 if [ "$failed" -gt 0 ] && [ "$ALLOW_FAILED" -eq 0 ]; then

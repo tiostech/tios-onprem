@@ -482,7 +482,7 @@ cmd_bake() {
   dir="$IMAGES_DIR/$id"
 
   # Only bake a VM whose user data and Salt have finished
-  virt-ls --ro -d "$id" /opt/tios 2>/dev/null | grep -x SALT_COMPLETE.txt >/dev/null \
+  virt-ls -d "$id" /opt/tios 2>/dev/null | grep -x SALT_COMPLETE.txt >/dev/null \
     || die "Salt has not finished on $id (no /opt/tios/SALT_COMPLETE.txt)."
 
   # Stop it as "stopped by API", so the reap timer never deletes it while we copy

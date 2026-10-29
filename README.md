@@ -451,7 +451,7 @@ sudo tiosvm-rebake --launcher ftrpowerflow --image ftrpowerflow --keep-builder
 It asks tiosaws (the `TIOSAWS_URL` in `/etc/tiosvm/agent.conf`) to launch a builder with
 `target=onprem` and no `queue_name` (so no worker starts), waits for the agent to start it, waits
 until `/opt/tios/SALT_COMPLETE.txt` and cloud-init's `boot-finished` exist inside the VM (read-only
-look with `virt-ls`), checks Salt's summary (stops on failed states unless `--allow-failed-states`),
+look with `virt-ls`, which never writes), checks Salt's summary (stops on failed states unless `--allow-failed-states`),
 bakes, and terminates the builder. Builders always start from plain Ubuntu, so each rebake is clean.
 
 ### By hand

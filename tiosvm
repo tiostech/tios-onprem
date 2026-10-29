@@ -12,7 +12,7 @@
 #   tiosvm console         ID|NAME     (serial console, Ctrl+] to leave)
 #   tiosvm console-output  ID|NAME     (boot + cloud-init log, like EC2 "get console output")
 #   tiosvm types                       (instance types and their CPU/RAM)
-#   tiosvm capacity                    (free CPU/RAM on this host)
+#   tiosvm capacity [--json]           (free CPU/RAM on this host)
 #   tiosvm image-update                (download the latest Ubuntu 24.04 cloud image)
 #   tiosvm bake           ID|NAME --image NAME   (save a finished VM as image NAME, like an AMI)
 #   tiosvm images                      (list base and baked images)
@@ -375,6 +375,14 @@ cmd_capacity() {
   local used_cpu used_mem max_cpu max_mem
   read -r used_cpu used_mem < <(used_resources)
   read -r max_cpu max_mem < <(host_totals)
+  if [ "${1:-}" = "--json" ]; then
+    jq -n --arg host "$(hostname -s)" --argjson tc "$max_cpu" --argjson tm "$max_mem" \
+          --argjson uc "$used_cpu" --argjson um "$used_mem" \
+          --argjson vms "$(all_state_files | wc -l | tr -d ' ')" \
+      '{host: $host, total_vcpu: $tc, total_mem_gb: $tm, used_vcpu: $uc, used_mem_gb: $um,
+        free_vcpu: ($tc - $uc), free_mem_gb: ($tm - $um), vms: $vms}'
+    return
+  fi
   echo "Running VMs use $used_cpu/$max_cpu vCPU and $used_mem/$max_mem GB RAM (free: $(( max_cpu - used_cpu )) vCPU, $(( max_mem - used_mem )) GB)."
 }
 
@@ -577,7 +585,7 @@ case "$cmd" in
   console)         [ $# -eq 1 ] || usage; cmd_console "$1" ;;
   console-output)  [ $# -eq 1 ] || usage; cmd_console_output "$1" ;;
   types)           cmd_types ;;
-  capacity)        cmd_capacity ;;
+  capacity)        cmd_capacity "${1:-}" ;;
   image-update)    cmd_image_update ;;
   bake)            [ $# -ge 3 ] || usage; cmd_bake "$@" ;;
   images)          cmd_images ;;

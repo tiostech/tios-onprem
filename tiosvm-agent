@@ -8,6 +8,8 @@ POST <TIOSAWS_URL>/onprem/sync with:
   gone       VMs that disappeared since the last sync (terminated or self-shut-down)
   failed     launches that failed
   requeue    launches the host had no room for (tiosvm exit code 3); tiosaws puts them back first
+  waiting    why those launches wait, e.g. "need 4 vCPU / 16 GB, free 20 vCPU / 5 GB"
+  capacity   this host's total / used / free vCPU and RAM
 and gets back {launch: request or null, terminate: [instance IDs]}, which it runs with tiosvm.
 
 Config: /etc/tiosvm/agent.conf (KEY=VALUE)
@@ -193,13 +195,22 @@ def launch(req):
     return "failed", (r.stderr or r.stdout).strip()[-500:]
 
 
+def host_capacity():
+    r = run([TIOSVM, "capacity", "--json"])
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return None
+
+
 def main():
     conf = read_conf()
     os.makedirs(SPOOL_DIR, exist_ok=True)
     interval = int(conf["INTERVAL"])
     log(f"tiosvm-agent syncing with {conf['TIOSAWS_URL']} every {interval}s")
 
-    failed, requeue = [], []
+    failed, requeue, waiting = [], [], []
+    last_wait_reason = {}  # instance id -> last logged reason, so a full host doesn't log every 10 s
     while True:
         try:
             # Launches claimed before a restart: finish them first
@@ -209,16 +220,25 @@ def main():
                 result, err = launch(req)
                 if result == "full":
                     requeue.append(req)
+                    reason = err.replace("InsufficientInstanceCapacity: ", "").rstrip(".")
+                    waiting.append({"id": req["instance_id"], "reason": reason})
+                    if last_wait_reason.get(req["instance_id"]) != reason:
+                        log(f"host full, {req['instance_id']} ({req['instance_type']}) waits: {reason}")
+                        last_wait_reason[req["instance_id"]] = reason
                 elif result == "failed":
                     failed.append({"id": req["instance_id"], "error": err})
+                    last_wait_reason.pop(req["instance_id"], None)
+                else:
+                    last_wait_reason.pop(req["instance_id"], None)
                 os.unlink(path)
 
             vms = local_instances()
             ids = {v["id"] for v in vms}
             gone = sorted(load_known() - ids)
-            resp = post_sync(conf, {"instances": vms, "gone": gone, "failed": failed, "requeue": requeue})
+            resp = post_sync(conf, {"instances": vms, "gone": gone, "failed": failed, "requeue": requeue,
+                                    "waiting": waiting, "capacity": host_capacity()})
             save_known(ids)
-            failed, requeue = [], []
+            failed, requeue, waiting = [], [], []
 
             for iid in resp.get("terminate") or []:
                 if iid in ids:

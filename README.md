@@ -493,7 +493,10 @@ meet at one API. If either side changes it, change the other side too.
   "instances": [{"id": "i-998b8fd6ca7274863", "ip": "10.50.0.11", "state": "running"}],
   "gone":      ["i-..."],
   "failed":    [{"id": "i-...", "error": "text"}],
-  "requeue":   [<launch request>]
+  "requeue":   [<launch request>],
+  "waiting":   [{"id": "i-...", "reason": "need 4 vCPU / 16 GB, free 20 vCPU / 5 GB"}],
+  "capacity":  {"host": "tios-vmhost01", "total_vcpu": 48, "total_mem_gb": 117,
+                "used_vcpu": 28, "used_mem_gb": 112, "free_vcpu": 20, "free_mem_gb": 5, "vms": 7}
 }
 ```
 
@@ -503,7 +506,16 @@ Response:
 { "launch": <launch request or null>, "terminate": ["i-..."] }
 ```
 
-No launch is handed out in a response to a sync that requeued one.
+No launch is handed out in a response to a sync that requeued one. A launch that doesn't fit waits
+at the front of the queue; tiosaws shows its instance as `waiting_for_capacity`.
+
+**`GET <TIOSAWS_URL>/onprem/status`** (read-only, no token): the host's capacity from the last sync
+(`agent_connected` is false if the agent hasn't reported for 60 s), the launch queue with the reason
+each entry waits, and pending terminations.
+
+```bash
+curl -s https://ec2manager-stage-internal.tioscapital.com/onprem/status | python3 -m json.tool
+```
 
 **Launch request** (one per instance, created by tiosaws):
 

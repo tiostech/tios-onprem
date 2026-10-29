@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+#
+# tiosvm-rebake - build a fresh on-prem image for a tiosaws launcher (the on-prem "AMI rebake").
+#
+#   sudo tiosvm-rebake [--launcher ftrpowerflow] [--image NAME] [--env production]
+#                      [--instance-type m6i.xlarge] [--volume-size 50]
+#                      [--allow-failed-states] [--keep-builder]
+#
+# 1. Asks tiosaws (TIOSAWS_URL in /etc/tiosvm/agent.conf) to launch ONE builder on-prem:
+#    target=onprem, secondary_name=imagebuilder, no queue_name (so no worker starts).
+# 2. Waits for tiosvm-agent to start it, then for its user data and Salt to finish
+#    (the normal 20-30+ minute setup from plain Ubuntu).
+# 3. Checks Salt's summary, then: tiosvm bake <builder> --image NAME
+#       -> /var/lib/libvirt/base/NAME-<date>.img, and NAME-latest.img points to it.
+# 4. Terminates the builder (unless --keep-builder).
+#
+# NAME defaults to the launcher name. Run it again when the Salt release changes, or monthly.
+# Run with sudo on the KVM host. See README.md.
+
+set -Eeuo pipefail
+# Note: no "cmd | grep -q" below (pipefail + early grep exit = false failure).
+
+CONF_FILE="/etc/tiosvm/agent.conf"
+STATE_DIR="/var/lib/tiosvm/instances"
+TIOSVM="/usr/local/bin/tiosvm"
+APPEAR_TIMEOUT_MIN=20      # builder must show up on the host within this
+SETUP_TIMEOUT_MIN=120      # user data + Salt must finish within this
+POLL_SECONDS=60
+
+LAUNCHER="ftrpowerflow"
+IMAGE=""
+ENV="production"
+INSTANCE_TYPE="m6i.xlarge"
+VOLUME_SIZE=50
+ALLOW_FAILED=0
+KEEP_BUILDER=0
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+die()   { echo "ERROR: $*" >&2; exit 1; }
+log()   { echo "$(date -u +%H:%M:%S) $*"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --launcher)            LAUNCHER="$2"; shift 2 ;;
+    --image)               IMAGE="$2"; shift 2 ;;
+    --env)                 ENV="$2"; shift 2 ;;
+    --instance-type)       INSTANCE_TYPE="$2"; shift 2 ;;
+    --volume-size)         VOLUME_SIZE="$2"; shift 2 ;;
+    --allow-failed-states) ALLOW_FAILED=1; shift ;;
+    --keep-builder)        KEEP_BUILDER=1; shift ;;
+    -h|--help)             usage ;;
+    *) echo "Unknown option: $1"; usage ;;
+  esac
+done
+IMAGE="${IMAGE:-$LAUNCHER}"
+
+[ "$(id -u)" -eq 0 ] || die "Run with sudo."
+[ -r "$CONF_FILE" ] || die "$CONF_FILE is missing. Set up tiosvm-agent first (README.md)."
+command -v virt-ls >/dev/null || die "virt-ls is missing (libguestfs-tools). Re-run setup_kvm_host.sh."
+systemctl is-active tiosvm-agent >/dev/null || die "tiosvm-agent is not running; it is what starts the builder."
+
+# ---- tiosaws connection (same as tiosvm-agent: resolve through DNS_SERVER if set) ----------
+TIOSAWS_URL=$(sed -n 's/^TIOSAWS_URL=//p' "$CONF_FILE" | tr -d '"' | tail -1)
+DNS_SERVER=$(sed -n 's/^DNS_SERVER=//p' "$CONF_FILE" | tr -d '"' | tail -1)
+[ -n "$TIOSAWS_URL" ] || die "TIOSAWS_URL is missing in $CONF_FILE"
+TIOSAWS_URL="${TIOSAWS_URL%/}"
+HOST=$(sed -E 's#^https?://([^/:]+).*#\1#' <<< "$TIOSAWS_URL")
+RESOLVE=()
+if [ -n "$DNS_SERVER" ]; then
+  answer=$(dig +short +time=3 +tries=2 "@$DNS_SERVER" "$HOST" A)
+  ip=$(awk '/^[0-9.]+$/ {print; exit}' <<< "$answer")
+  [ -n "$ip" ] || die "Cannot resolve $HOST via $DNS_SERVER (is Tailscale up?)"
+  RESOLVE=(--resolve "$HOST:443:$ip")
+fi
+tiosaws() { curl -sS -m 30 ${RESOLVE[@]+"${RESOLVE[@]}"} "$@"; }
+
+started=$(date +%s)
+elapsed() { echo "$(( ($(date +%s) - started) / 60 )) min"; }
+
+# ---- 1. Ask tiosaws for a builder -------------------------------------------------------------
+body=$(jq -n --arg env "$ENV" --arg type "$INSTANCE_TYPE" --argjson size "$VOLUME_SIZE" \
+  '{env: $env, force_allow_production_launching: true, target: "onprem",
+    secondary_name: "imagebuilder", instance_type: $type, volume_size: $size}')
+log "Asking $TIOSAWS_URL to launch a $LAUNCHER builder on-prem ($ENV, $INSTANCE_TYPE, ${VOLUME_SIZE}G)"
+resp=$(tiosaws -X POST "$TIOSAWS_URL/launchers/$LAUNCHER" -H 'Content-Type: application/json' -d "$body") \
+  || die "tiosaws did not answer."
+uuid=$(jq -r '.uuid // empty' <<< "$resp" 2>/dev/null || true)
+[ -n "$uuid" ] || die "tiosaws refused the launch: $resp"
+log "Cluster $uuid queued"
+
+# ---- 2a. Wait for the agent to start it ---------------------------------------------------------
+id=""
+for _ in $(seq 1 $(( APPEAR_TIMEOUT_MIN * 60 / 10 ))); do
+  for f in "$STATE_DIR"/i-*.json; do
+    [ -e "$f" ] || continue
+    if [ "$(jq -r '.tags.cluster_uuid // ""' "$f")" = "$uuid" ]; then id=$(jq -r .id "$f"); break; fi
+  done
+  [ -n "$id" ] && break
+  sleep 10
+done
+[ -n "$id" ] || die "No builder appeared within $APPEAR_TIMEOUT_MIN min. Check: journalctl -u tiosvm-agent"
+log "Builder $id started ($(jq -r .ip "$STATE_DIR/$id.json")). Waiting for user data and Salt (usually 20-30+ min) ..."
+
+# ---- 2b. Wait for user data + Salt to finish ------------------------------------------------------
+guest_has() { # guest_has DIR FILE  (read-only look into the running VM's disk)
+  virt-ls --ro -d "$id" "$1" 2>/dev/null | grep -x "$2" >/dev/null
+}
+done_ok=0
+for _ in $(seq 1 $(( SETUP_TIMEOUT_MIN * 60 / POLL_SECONDS ))); do
+  [ -e "$STATE_DIR/$id.json" ] || die "Builder $id disappeared (terminated?)."
+  if guest_has /opt/tios SALT_COMPLETE.txt && guest_has /var/lib/cloud/instance boot-finished; then
+    done_ok=1; break
+  fi
+  sleep "$POLL_SECONDS"
+done
+[ "$done_ok" -eq 1 ] || die "Builder $id did not finish within $SETUP_TIMEOUT_MIN min. Look at it: sudo tiosvm console-output $id"
+log "User data and Salt finished after $(elapsed)"
+
+# ---- 3. Check Salt's result, then bake ------------------------------------------------------------
+summary=$(virt-cat --ro -d "$id" /var/log/cloud-init-output.log 2>/dev/null | grep -a -A4 '^Summary for local' || true)
+echo "$summary" | grep -aE 'Succeeded|Failed' || true
+failed=$(echo "$summary" | awk '/^Failed:/ {n=$2} END {print n+0}')
+if [ "$failed" -gt 0 ] && [ "$ALLOW_FAILED" -eq 0 ]; then
+  die "The last Salt run had $failed failed states. Builder $id is kept for a look. Re-run with --allow-failed-states to bake anyway."
+fi
+
+log "Baking image '$IMAGE' from $id"
+"$TIOSVM" bake "$id" --image "$IMAGE"
+
+# ---- 4. Remove the builder ---------------------------------------------------------------------------
+if [ "$KEEP_BUILDER" -eq 1 ]; then
+  log "Keeping builder $id (stopped). Remove it with: sudo tiosvm terminate $id"
+else
+  "$TIOSVM" terminate "$id"
+fi
+log "Done in $(elapsed). New launches with --image $IMAGE use $(readlink "/var/lib/libvirt/base/$IMAGE-latest.img")"

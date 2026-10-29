@@ -38,6 +38,7 @@ AGENT_DIR = "/var/lib/tiosvm/agent"
 SPOOL_DIR = os.path.join(AGENT_DIR, "spool")         # claimed launches not finished yet
 KNOWN_FILE = os.path.join(AGENT_DIR, "known.json")   # VM IDs seen at the last sync
 TIOSVM = "/usr/local/bin/tiosvm"
+BASE_DIR = "/var/lib/libvirt/base"
 CAPACITY_EXIT = 3
 
 
@@ -136,6 +137,27 @@ def save_known(ids):
     os.replace(tmp, KNOWN_FILE)
 
 
+def pick_image(req):
+    """Baked image for this launch, or None for plain Ubuntu.
+
+    tiosaws sends the launcher's image name (e.g. "ftrpowerflow"). It is used if this host has
+    <name>-latest.img. Image builders (tiosvm-rebake, name "...-imagebuilder.") always start
+    from plain Ubuntu so every rebake is a clean build.
+    """
+    name = req.get("image")
+    if not name or "-imagebuilder." in req.get("name", ""):
+        return None, 0
+    path = os.path.join(BASE_DIR, f"{name}-latest.img")
+    if not os.path.exists(path):
+        return None, 0
+    info = run(["qemu-img", "info", "-U", "--output", "json", path])
+    try:
+        gb = json.loads(info.stdout)["virtual-size"] // (1024 ** 3)
+    except (ValueError, KeyError):
+        return None, 0
+    return name, gb
+
+
 def launch(req):
     """Returns ('ok' | 'full' | 'failed', error text)."""
     iid = req["instance_id"]
@@ -144,9 +166,13 @@ def launch(req):
     with tempfile.NamedTemporaryFile("wb", delete=False, dir=AGENT_DIR, suffix=".user-data") as f:
         f.write(base64.b64decode(req["user_data_base64"]))
         user_data = f.name
+    image, image_gb = pick_image(req)
+    disk_gb = max(int(req["disk_gb"]), image_gb)  # a VM disk can't be smaller than its image
     cmd = [TIOSVM, "launch", "--instance-id", iid, "--name", req["name"],
-           "--type", req["instance_type"], "--disk", f"{int(req['disk_gb'])}G",
+           "--type", req["instance_type"], "--disk", f"{disk_gb}G",
            "--user-data", user_data]
+    if image:
+        cmd += ["--image", image]
     if req.get("iam_role"):
         cmd += ["--iam-role", req["iam_role"]]
     if req.get("terminate_on_shutdown"):
@@ -159,7 +185,8 @@ def launch(req):
     finally:
         os.unlink(user_data)
     if r.returncode == 0:
-        log(f"launched {iid} ({req['instance_type']}) {r.stdout.splitlines()[0] if r.stdout else ''}")
+        log(f"launched {iid} ({req['instance_type']}, image {image or 'plain ubuntu'}) "
+            f"{r.stdout.splitlines()[0] if r.stdout else ''}")
         return "ok", ""
     if r.returncode == CAPACITY_EXIT:
         return "full", r.stderr.strip()

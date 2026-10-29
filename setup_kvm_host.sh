@@ -94,7 +94,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q \
   qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients virtinst ovmf \
-  cloud-image-utils dnsmasq-base zfsutils-linux nftables jq curl chrony python3 python3-boto3 bind9-dnsutils rasdaemon
+  cloud-image-utils dnsmasq-base zfsutils-linux nftables jq curl chrony python3 python3-boto3 bind9-dnsutils rasdaemon libguestfs-tools
 apt-get install -y -q --no-install-recommends smartmontools   # no mail packages
 systemctl enable --now libvirtd
 systemctl enable --now rasdaemon   # logs memory/hardware errors with the exact DIMM slot
@@ -321,7 +321,7 @@ fi
 # ---- 5. tiosvm ----------------------------------------------------------------
 log "Installing tiosvm"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-for f in tiosvm tiosvm-metadata tiosvm-agent; do
+for f in tiosvm tiosvm-metadata tiosvm-agent tiosvm-rebake; do
   if [ -f "$SCRIPT_DIR/$f" ]; then
     install -m 755 "$SCRIPT_DIR/$f" "/usr/local/bin/$f"
   else

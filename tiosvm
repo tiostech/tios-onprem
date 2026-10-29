@@ -5,6 +5,7 @@
 #   tiosvm launch --name NAME [--type TYPE | --cpus N --memory GB] [--disk 50G]
 #                 [--user-data FILE] [--tag KEY=VALUE]... [--ssh-key FILE]
 #                 [--terminate-on-shutdown] [--iam-role ROLE] [--instance-id i-...]
+#                 [--image NAME]                    (baked image; default plain Ubuntu)
 #   tiosvm list
 #   tiosvm describe        ID|NAME
 #   tiosvm start|stop|reboot|terminate ID|NAME...
@@ -13,6 +14,9 @@
 #   tiosvm types                       (instance types and their CPU/RAM)
 #   tiosvm capacity                    (free CPU/RAM on this host)
 #   tiosvm image-update                (download the latest Ubuntu 24.04 cloud image)
+#   tiosvm bake           ID|NAME --image NAME   (save a finished VM as image NAME, like an AMI)
+#   tiosvm images                      (list base and baked images)
+#   tiosvm image-delete   FILE         (delete an image no VM uses)
 #   tiosvm reap                        (delete VMs launched with --terminate-on-shutdown that shut down)
 #
 # Exit code 3 = not enough free CPU/RAM (like EC2 InsufficientInstanceCapacity).
@@ -161,6 +165,19 @@ check_capacity() { # check_capacity CPUS MEM_GB
   fi
 }
 
+# NAME (e.g. ftrpowerflow), NAME-<stamp>, or a file name in $BASE_DIR -> full path of the image file
+image_path() {
+  local n="$1" c
+  for c in "$BASE_DIR/$n-latest.img" "$BASE_DIR/$n.img" "$BASE_DIR/$n"; do
+    [ -e "$c" ] && { readlink -f "$c"; return 0; }
+  done
+  return 1
+}
+
+image_gb() { # virtual size of an image in whole GB
+  echo $(( $(qemu-img info -U --output json "$1" | jq '."virtual-size"') / 1024 / 1024 / 1024 ))
+}
+
 os_variant() {
   if virt-install --osinfo list 2>/dev/null | grep -E '(^|[ ,])ubuntu24\.04(,|$)' >/dev/null; then
     echo "ubuntu24.04"
@@ -189,7 +206,7 @@ cmd_image_update() {
 
 cmd_launch() {
   need_root
-  local name="" type="" cpus="" mem="" disk="$DEFAULT_DISK" user_data="" key_file="" tos=false iam_role="" iid=""
+  local name="" type="" cpus="" mem="" disk="$DEFAULT_DISK" user_data="" key_file="" tos=false iam_role="" iid="" image_name=""
   local tags=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -204,6 +221,7 @@ cmd_launch() {
       --terminate-on-shutdown)  tos=true; shift ;;
       --iam-role)               iam_role="$2"; shift 2 ;;
       --instance-id)            iid="$2"; shift 2 ;;   # tiosaws creates the ID up front
+      --image)                  image_name="$2"; shift 2 ;;
       *) die "Unknown launch option: $1" ;;
     esac
   done
@@ -236,7 +254,15 @@ cmd_launch() {
   fi
   command -v cloud-localds >/dev/null || die "cloud-localds is missing. Re-run setup_kvm_host.sh."
 
-  [ -e "$BASE_IMAGE" ] || cmd_image_update
+  local base
+  if [ -n "$image_name" ]; then
+    base=$(image_path "$image_name") || die "No image '$image_name' on this host. See: tiosvm images"
+  else
+    [ -e "$BASE_IMAGE" ] || cmd_image_update
+    base=$(readlink -f "$BASE_IMAGE")
+  fi
+  local base_gb; base_gb=$(image_gb "$base")
+  [ "${disk%G}" -ge "$base_gb" ] || die "--disk must be at least ${base_gb}G for image $(basename "$base")."
 
   mkdir -p "$STATE_DIR"
   take_lock
@@ -260,7 +286,7 @@ cmd_launch() {
   jq -n --arg id "$iid" --arg name "$name" --arg type "${type:-custom}" \
         --argjson cpus "$cpus" --argjson mem "$mem" --arg disk "$disk" \
         --arg ip "$ip" --arg mac "$mac" --arg host "$hostname" \
-        --arg image "$(basename "$(readlink -f "$BASE_IMAGE")" .img)" \
+        --arg image "$(basename "$base" .img)" \
         --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson epoch "$(date +%s)" \
         --argjson tos "$tos" --argjson tags "$tags_json" --arg role "$iam_role" \
     '{id: $id, name: $name, type: $type, cpus: $cpus, memory_gb: $mem, disk: $disk,
@@ -271,7 +297,7 @@ cmd_launch() {
   trap 'echo "Launch failed, cleaning up $iid" >&2; terminate_one "$iid" >/dev/null 2>&1 || true' ERR
 
   # Root disk: thin copy of the base image, grown to --disk on first boot by cloud-init
-  qemu-img create -q -f qcow2 -F qcow2 -b "$(readlink -f "$BASE_IMAGE")" "$dir/disk.qcow2" "$disk"
+  qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$dir/disk.qcow2" "$disk"
 
   # cloud-init NoCloud seed. User data is passed through unchanged, same as EC2.
   local keys_json
@@ -437,6 +463,92 @@ cmd_console_output() {
   cat "$CONSOLE_LOG_DIR/$id-console.log" 2>/dev/null || die "No console log yet for $id."
 }
 
+# Save a finished VM as a reusable image (like creating an AMI):
+# stop it, copy its disk into one standalone file, clean it, publish it as NAME-latest.
+cmd_bake() {
+  need_root
+  local id name="" f dir stamp tmp out
+  id=$(resolve_id "$1"); shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --image) name="$2"; shift 2 ;;
+      *) die "Unknown bake option: $1" ;;
+    esac
+  done
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || die "--image must be lowercase letters, digits and '-' (e.g. ftrpowerflow)."
+  [[ "$name" != *-latest ]] || die "--image must not end in -latest."
+  command -v virt-sysprep >/dev/null || die "virt-sysprep is missing (libguestfs-tools). Re-run setup_kvm_host.sh."
+  f=$(state_file "$id")
+  dir="$IMAGES_DIR/$id"
+
+  # Only bake a VM whose user data and Salt have finished
+  virt-ls --ro -d "$id" /opt/tios 2>/dev/null | grep -x SALT_COMPLETE.txt >/dev/null \
+    || die "Salt has not finished on $id (no /opt/tios/SALT_COMPLETE.txt)."
+
+  # Stop it as "stopped by API", so the reap timer never deletes it while we copy
+  cmd_stop "$id"
+
+  stamp=$(date -u +%Y%m%d-%H%M)
+  out="$BASE_DIR/$name-$stamp.img"
+  tmp="$BASE_DIR/.bake-$name-$stamp.img"
+  trap 'rm -f "$tmp"' ERR
+
+  echo "Copying the disk into one standalone image ..."
+  qemu-img convert -p -O qcow2 "$dir/disk.qcow2" "$tmp"
+
+  # Remove everything that belongs to this one VM, and every secret.
+  # "defaults" = machine-id, SSH host keys, ~/.ssh dirs, logs, shell history, tmp files, ...
+  echo "Cleaning the image ..."
+  virt-sysprep -q -a "$tmp" --operations defaults \
+    --delete /root/.secrets \
+    --delete /root/.ssh \
+    --delete /etc/netplan/50-cloud-init.yaml \
+    --delete /opt/tios/SALT_COMPLETE.txt \
+    --delete /etc/salt/minion_id \
+    --run-command 'cloud-init clean --logs || true'
+
+  mv "$tmp" "$out"
+  chmod 444 "$out"
+  trap - ERR
+  ln -sfn "$(basename "$out")" "$BASE_DIR/$name-latest.img"
+  jq -n --arg name "$name" --arg file "$(basename "$out")" --arg from "$id" \
+        --arg from_image "$(jq -r .image "$f")" --arg salt "$(jq -r '.tags.salt_release // ""' "$f")" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson gb "$(image_gb "$out")" \
+    '{name: $name, file: $file, created_at: $at, disk_gb: $gb, source_instance: $from,
+      source_image: $from_image, salt_release: $salt}' > "$out.json"
+  echo "Baked $(basename "$out") ($(du -h "$out" | cut -f1)); $name-latest.img now points to it."
+  echo "The builder $id is stopped. Remove it with: sudo tiosvm terminate $id"
+}
+
+cmd_images() {
+  printf '%-36s %6s %6s %-17s %4s  %s\n' IMAGE FILE DISK CREATED VMS NAMES
+  local img b used names
+  for img in "$BASE_DIR"/*.img; do
+    [ -e "$img" ] && [ ! -L "$img" ] || continue
+    b=$(basename "$img" .img)
+    used=$(all_state_files | while read -r f; do jq -r .image "$f"; done | grep -cx "$b" || true)
+    names=$(for l in "$BASE_DIR"/*.img; do [ -L "$l" ] && [ "$(readlink -f "$l")" = "$img" ] && basename "$l" .img; done | tr '\n' ' ' || true)
+    printf '%-36s %6s %5sG %-17s %4s  %s\n' "$b" "$(du -h "$img" | cut -f1)" "$(image_gb "$img")" \
+      "$(date -u -r "$img" '+%Y-%m-%d %H:%M')" "$used" "$names"
+  done
+}
+
+cmd_image_delete() {
+  need_root
+  local img b l
+  img=$(image_path "$1") || die "No image '$1'. See: tiosvm images"
+  [ -L "$BASE_DIR/$1" ] || [ -L "$BASE_DIR/$1.img" ] || [ -L "$BASE_DIR/$1-latest.img" ] \
+    && die "'$1' is a name, not a file. Give the file, e.g. ftrpowerflow-20261029-1200."
+  b=$(basename "$img" .img)
+  for l in "$BASE_DIR"/*.img; do
+    [ -L "$l" ] && [ "$(readlink -f "$l")" = "$img" ] && die "$b is the current $(basename "$l" .img). Bake a newer one first."
+  done
+  all_state_files | while read -r f; do jq -r .image "$f"; done | grep -x "$b" >/dev/null \
+    && die "$b is still used by a VM (it is the base of its disk). Terminate those VMs first."
+  rm -f "$img" "$img.json"
+  echo "Deleted $b"
+}
+
 cmd_reap() {
   need_root
   take_lock
@@ -451,7 +563,7 @@ cmd_reap() {
 }
 
 # ---- Main --------------------------------------------------------------------
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
@@ -466,6 +578,9 @@ case "$cmd" in
   types)           cmd_types ;;
   capacity)        cmd_capacity ;;
   image-update)    cmd_image_update ;;
+  bake)            [ $# -ge 3 ] || usage; cmd_bake "$@" ;;
+  images)          cmd_images ;;
+  image-delete)    [ $# -eq 1 ] || usage; cmd_image_delete "$1" ;;
   reap)            cmd_reap ;;
   *)               usage ;;
 esac

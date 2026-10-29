@@ -11,6 +11,7 @@ They run on the host itself. tiosaws launches VMs here through the `/onprem/sync
 | `tiosvm` | Launch and manage VMs (the host's "EC2 API") |
 | `tiosvm-metadata` | EC2-style metadata service for the VMs (`169.254.169.254`), including IAM role credentials |
 | `tiosvm-agent` | Picks up launches and terminations from tiosaws |
+| `tiosvm-rebake` | Builds a fresh baked image for a launcher (the on-prem "AMI rebake") |
 
 ```
  Tailscale users
@@ -425,6 +426,60 @@ role credentials). AWS side for tios-vmhost01 (2026-10-23): trust anchor `tios-o
 
 1. Phase 4 (tiosaws `target: "onprem"` for `ftrpowerflow` + `tiosvm-agent`) is written; test on stage.
 
+## Images (baking)
+
+From plain Ubuntu, an ftrpowerflow VM spends 20-30+ minutes in Salt (it compiles Redis and
+SYMPHONY). A **baked image** already contains all of that, like the EC2 AMI, so the user data only
+runs its quick steps (secrets, environment, Salt pull, a short highstate, worker): a few minutes.
+
+```
+1. Builder  tiosaws launches one VM on-prem from plain Ubuntu (target=onprem, secondary_name=imagebuilder)
+2. Bake     when Salt is done: stop it, copy its disk into one file, clean it
+              /var/lib/libvirt/base/ftrpowerflow-20261029-1200.img
+              ftrpowerflow-latest.img -> that file
+3. Use      tiosaws sends image=ftrpowerflow; the agent launches with --image ftrpowerflow
+4. Rebake   when the Salt release changes, or monthly
+```
+
+### One command: `tiosvm-rebake`
+
+```bash
+sudo tiosvm-rebake                                   # ftrpowerflow, production, m6i.xlarge, 50G
+sudo tiosvm-rebake --launcher ftrpowerflow --image ftrpowerflow --keep-builder
+```
+
+It asks tiosaws (the `TIOSAWS_URL` in `/etc/tiosvm/agent.conf`) to launch a builder with
+`target=onprem` and no `queue_name` (so no worker starts), waits for the agent to start it, waits
+until `/opt/tios/SALT_COMPLETE.txt` and cloud-init's `boot-finished` exist inside the VM (read-only
+look with `virt-ls`), checks Salt's summary (stops on failed states unless `--allow-failed-states`),
+bakes, and terminates the builder. Builders always start from plain Ubuntu, so each rebake is clean.
+
+### By hand
+
+```bash
+sudo tiosvm bake <id> --image ftrpowerflow      # VM must have finished Salt
+sudo tiosvm images                              # list images, which VMs use them, current names
+sudo tiosvm launch --name test --type m6i.xlarge --disk 50G --image ftrpowerflow
+sudo tiosvm image-delete ftrpowerflow-20261001-0900   # refused if current or still used
+```
+
+### What `bake` removes (like AMI prep)
+
+`virt-sysprep` defaults (machine-id, SSH host keys, all `~/.ssh` folders, logs, shell history, tmp
+files, DHCP leases), plus `/root/.secrets`, `/root/.ssh` (GitHub deploy key),
+`/etc/netplan/50-cloud-init.yaml`, `/opt/tios/SALT_COMPLETE.txt`, `/etc/salt/minion_id`, and
+cloud-init's state (`cloud-init clean --logs`), so the user data runs again on every new VM.
+**Images never contain secrets**; every VM downloads its own at boot.
+
+### Notes
+
+- An image keeps the builder's disk size (default 50G). VMs from it can be larger, not smaller;
+  the agent raises `disk_gb` to the image size if needed.
+- Old images stay while VMs use them (they are the base of those disks). `tiosvm images` shows the
+  count; delete old ones with `tiosvm image-delete`.
+- Rebake when tiosaws' Salt release for the launcher changes (`config/salt.yml`), and monthly for
+  security updates. A monthly cron line: `0 3 1 * * root /usr/local/bin/tiosvm-rebake >> /var/log/tiosvm-rebake.log 2>&1`.
+
 ## tiosaws API
 
 This repo and tiosaws (`app/modules/ec2_helpers/onprem.rb`, `app/controllers/onprem_controller.rb`)
@@ -462,6 +517,7 @@ No launch is handed out in a response to a sync that requeued one.
 | `terminate_on_shutdown` | `true` | `--terminate-on-shutdown` |
 | `tags` | `{"env": "production", ...}` | `--tag key=value` |
 | `user_data_base64` | | decoded into `--user-data` |
+| `image` | `ftrpowerflow` | `--image` if the host has `<image>-latest.img`, else plain Ubuntu |
 | `request_uuid`, `cluster_uuid` | | for tiosaws' own records |
 
 Self-shutdown: an on-prem VM calls tiosaws `instances/self_shutdown_terminate` like an EC2 instance;

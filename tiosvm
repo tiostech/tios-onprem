@@ -505,7 +505,8 @@ cmd_bake() {
     --delete /etc/netplan/50-cloud-init.yaml \
     --delete /opt/tios/SALT_COMPLETE.txt \
     --delete /etc/salt/minion_id \
-    --run-command 'cloud-init clean --logs || true'
+    --run-command 'cloud-init clean --logs || true' \
+    --truncate /etc/machine-id
 
   mv "$tmp" "$out"
   chmod 444 "$out"

@@ -467,7 +467,7 @@ sudo tiosvm image-delete ftrpowerflow-20261001-0900   # refused if current or st
 
 `virt-sysprep` defaults (machine-id, SSH host keys, all `~/.ssh` folders, logs, shell history, tmp
 files, DHCP leases), plus `/root/.secrets`, `/root/.ssh` (GitHub deploy key),
-`/etc/netplan/50-cloud-init.yaml`, `/opt/tios/SALT_COMPLETE.txt`, `/etc/salt/minion_id`, and
+`/etc/netplan/50-cloud-init.yaml`, `/opt/tios/SALT_COMPLETE.txt`, `/etc/salt/minion_id`, an empty `/etc/machine-id` (each VM makes its own), and
 cloud-init's state (`cloud-init clean --logs`), so the user data runs again on every new VM.
 **Images never contain secrets**; every VM downloads its own at boot.
 

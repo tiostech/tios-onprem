@@ -80,7 +80,8 @@ elapsed() { echo "$(( ($(date +%s) - started) / 60 )) min"; }
 # ---- 1. Ask tiosaws for a builder -------------------------------------------------------------
 body=$(jq -n --arg env "$ENV" --arg type "$INSTANCE_TYPE" --argjson size "$VOLUME_SIZE" \
   '{env: $env, force_allow_production_launching: true, target: "onprem",
-    secondary_name: "imagebuilder", instance_type: $type, volume_size: $size}')
+    secondary_name: "imagebuilder", instance_type: $type, group_or_instance_type: $type,
+    volume_size: $size}')   # rrunner* take group_or_instance_type; each launcher drops the key it doesn't have
 log "Asking $TIOSAWS_URL to launch a $LAUNCHER builder on-prem ($ENV, $INSTANCE_TYPE, ${VOLUME_SIZE}G)"
 resp=$(tiosaws -X POST "$TIOSAWS_URL/launchers/$LAUNCHER" -H 'Content-Type: application/json' -d "$body") \
   || die "tiosaws did not answer."

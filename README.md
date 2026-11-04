@@ -449,6 +449,7 @@ runs its quick steps (secrets, environment, Salt pull, a short highstate, worker
 ```bash
 sudo tiosvm-rebake                                   # ftrpowerflow, production, m6i.xlarge, 50G
 sudo tiosvm-rebake --launcher ftrpowerflow --image ftrpowerflow --keep-builder
+sudo tiosvm-rebake --launcher rrunnerftr --instance-type r5.xlarge   # image rrunnerftr
 ```
 
 It asks tiosaws (the `TIOSAWS_URL` in `/etc/tiosvm/agent.conf`) to launch a builder with

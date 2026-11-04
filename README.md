@@ -12,6 +12,7 @@ They run on the host itself. tiosaws launches VMs here through the `/onprem/sync
 | `tiosvm-metadata` | EC2-style metadata service for the VMs (`169.254.169.254`), including IAM role credentials |
 | `tiosvm-agent` | Picks up launches and terminations from tiosaws |
 | `tiosvm-rebake` | Builds a fresh baked image for a launcher (the on-prem "AMI rebake") |
+| `deploy.sh` | Run on your laptop: copies this repo to the host, installs the changed `tiosvm*` scripts and restarts their services |
 
 ```
  Tailscale users
@@ -424,8 +425,8 @@ POST launchers/ftrpowerflow  {env, target: "onprem", ...}
 Done on tios-vmhost01: phase 1 (host setup), phase 2 (`tiosvm`), phase 3 (metadata, time and IAM
 role credentials). AWS side for tios-vmhost01 (2026-10-23): trust anchor `tios-onprem`
 (`trust-anchor/d98e7c0c-8e31-4d9e-8ed4-b6b835d19511`), profile `tios-onprem-kvm-host`
-(`profile/7b042cf3-97dc-4758-b63c-f17cda61850e`), role `TiosOnpremKvmHost`; allowed VM role:
-`TiosSysSetupFtrpowerflow`.
+(`profile/7b042cf3-97dc-4758-b63c-f17cda61850e`), role `TiosOnpremKvmHost`; allowed VM roles:
+`TiosSysSetupFtrpowerflow` (ftrpowerflow), `TiosSysSetupRshinyftr` (rrunnerftr, added 2026-11-04).
 
 1. Phase 4 (tiosaws `target: "onprem"` for `ftrpowerflow` + `tiosvm-agent`) is written; test on stage.
 

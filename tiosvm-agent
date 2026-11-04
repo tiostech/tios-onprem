@@ -170,9 +170,14 @@ def launch(req):
         user_data = f.name
     image, image_gb = pick_image(req)
     disk_gb = max(int(req["disk_gb"]), image_gb)  # a VM disk can't be smaller than its image
+    if req.get("cpus") and req.get("memory_gb"):
+        size = ["--cpus", str(int(req["cpus"])), "--memory", str(int(req["memory_gb"]))]  # custom size
+        size_text = f"{req['cpus']} vCPU / {req['memory_gb']} GB"
+    else:
+        size = ["--type", req["instance_type"]]
+        size_text = req["instance_type"]
     cmd = [TIOSVM, "launch", "--instance-id", iid, "--name", req["name"],
-           "--type", req["instance_type"], "--disk", f"{disk_gb}G",
-           "--user-data", user_data]
+           *size, "--disk", f"{disk_gb}G", "--user-data", user_data]
     if image:
         cmd += ["--image", image]
     if req.get("iam_role"):
@@ -187,7 +192,7 @@ def launch(req):
     finally:
         os.unlink(user_data)
     if r.returncode == 0:
-        log(f"launched {iid} ({req['instance_type']}, image {image or 'plain ubuntu'}) "
+        log(f"launched {iid} ({size_text}, image {image or 'plain ubuntu'}) "
             f"{r.stdout.splitlines()[0] if r.stdout else ''}")
         return "ok", ""
     if r.returncode == CAPACITY_EXIT:
@@ -223,7 +228,7 @@ def main():
                     reason = err.replace("InsufficientInstanceCapacity: ", "").rstrip(".")
                     waiting.append({"id": req["instance_id"], "reason": reason})
                     if last_wait_reason.get(req["instance_id"]) != reason:
-                        log(f"host full, {req['instance_id']} ({req['instance_type']}) waits: {reason}")
+                        log(f"host full, {req['instance_id']} waits: {reason}")
                         last_wait_reason[req["instance_id"]] = reason
                 elif result == "failed":
                     failed.append({"id": req["instance_id"], "error": err})

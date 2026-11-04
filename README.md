@@ -215,7 +215,7 @@ How it works:
 | IP | Fixed for the life of the VM, from `10.50.0.10-99`, set inside the VM by cloud-init (not DHCP). IPs that still have a DHCP lease are skipped. Hostname `ip-10-50-0-N`, like EC2. |
 | User data | Passed to cloud-init unchanged (bash, `#cloud-config` or MIME multipart, same as EC2). Runs on first boot. |
 | SSH | Keys in `/etc/tiosvm/authorized_keys` are added to the `ubuntu` user, like an EC2 key pair. Setup copies them from the admin user. `--ssh-key FILE` uses other keys. |
-| Capacity | Launch only succeeds if running VMs leave enough room: host threads for vCPUs (no overcommit) and host RAM minus 8 GB. Otherwise exit code 3 `InsufficientInstanceCapacity`. Stopped VMs don't count. |
+| Capacity | Launch only succeeds if running VMs leave enough room: host threads for vCPUs (no overcommit) and host RAM minus 8 GB. Otherwise exit code 3 `InsufficientInstanceCapacity`. Stopped VMs don't count. A type bigger than the whole host (e.g. `r8i.4xlarge`, 128 GB) fails with exit code 1 "Too big for this host" instead, so it never waits. |
 | `--terminate-on-shutdown` | When the VM powers itself off, it is deleted within a minute, like EC2 "shutdown behavior: terminate". `tiosvm stop` never deletes a VM. |
 | Host reboot | Running VMs start again automatically. VMs stopped with `tiosvm stop` stay stopped. |
 | Network filter | Each VM gets libvirt's `clean-traffic` filter: it can only use its own IP and MAC (no spoofing other VMs). |
@@ -416,6 +416,9 @@ POST launchers/ftrpowerflow  {env, target: "onprem", ...}
 
    Watch it with `sudo tiosvm list` and `sudo tiosvm console-output <id>` on the host.
 
+   Custom size (no AWS type has it): add `"onprem_cpus": 40, "onprem_memory_gb": 100`.
+   `instance_type` is still required (tiosaws validates and records it) but its size is ignored.
+
 ## Next phases
 
 Done on tios-vmhost01: phase 1 (host setup), phase 2 (`tiosvm`), phase 3 (metadata, time and IAM
@@ -508,6 +511,7 @@ Response:
 
 No launch is handed out in a response to a sync that requeued one. A launch that doesn't fit waits
 at the front of the queue; tiosaws shows its instance as `waiting_for_capacity`.
+A launch bigger than the whole host is reported as `failed` (not requeued), so it can't block the queue.
 
 **`GET <TIOSAWS_URL>/onprem/status`** (read-only, no token): the host's capacity from the last sync
 (`agent_connected` is false if the agent hasn't reported for 60 s), the launch queue with the reason
@@ -524,6 +528,7 @@ curl -s https://ec2manager-stage-internal.tioscapital.com/onprem/status | python
 | `instance_id` | `i-998b8fd6ca7274863` | `tiosvm launch --instance-id` |
 | `name` | `ftrpowerflow-console.vpcint.tioscapital.com` | `--name` (EC2 `Name` tag) |
 | `instance_type` | `m6i.xlarge` | `--type` (must be in `tiosvm types`) |
+| `cpus`, `memory_gb` | `40`, `100` | optional custom size: `--cpus 40 --memory 100` instead of `--type` (launcher fields `onprem_cpus`, `onprem_memory_gb`) |
 | `disk_gb` | `50` | `--disk 50G` |
 | `iam_role` | `TiosSysSetupFtrpowerflow` | `--iam-role` |
 | `terminate_on_shutdown` | `true` | `--terminate-on-shutdown` |

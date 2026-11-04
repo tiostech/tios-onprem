@@ -159,6 +159,10 @@ check_capacity() { # check_capacity CPUS MEM_GB
   local cpus="$1" mem="$2" used_cpu used_mem max_cpu max_mem
   read -r used_cpu used_mem < <(used_resources)
   read -r max_cpu max_mem < <(host_totals)
+  # Bigger than the whole host: it would wait forever, so fail now (exit 1, not 3)
+  if [ "$cpus" -gt "$max_cpu" ] || [ "$mem" -gt "$max_mem" ]; then
+    die "Too big for this host: need $cpus vCPU / ${mem} GB, this host can give at most $max_cpu vCPU / ${max_mem} GB."
+  fi
   if [ $(( used_cpu + cpus )) -gt "$max_cpu" ] || [ $(( used_mem + mem )) -gt "$max_mem" ]; then
     echo "InsufficientInstanceCapacity: need $cpus vCPU / ${mem} GB, free $(( max_cpu - used_cpu )) vCPU / $(( max_mem - used_mem )) GB." >&2
     exit 3
